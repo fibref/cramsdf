@@ -1,5 +1,6 @@
 #include <numbers>
 #include <algorithm>
+#include <iostream>
 
 #include "cramsdf.h"
 
@@ -150,17 +151,17 @@ Vec2 Segment::tangent(float t, SegmentType type) const {
     }
 }
 
-float Shape::signed_dist(const Vec2& point, WindingOrder winding_order) const {
+float Shape::signed_dist(const Vec2& point) const {
     float min_dist2 = std::numeric_limits<float>::max();
     float min_t = 0.0f;
     unsigned min_index = 0;
 
-    for (size_t i = 0; i < segments.size(); ++i) {
+    for (unsigned i = 0; i < segments.size(); ++i) {
         auto [t, dist2] = segments[i].dist2(point, types[i]);
         if (dist2 < min_dist2) {
             min_dist2 = dist2;
             min_t = t;
-            min_index = static_cast<unsigned>(i);
+            min_index = i;
         }
     }
     if (min_t > 0.0f && min_t < 1.0f) {
@@ -214,9 +215,113 @@ void Shape::sdf(unsigned spread, unsigned char* buffer, unsigned width, unsigned
     for (unsigned i = 0; i < height; ++i) {
         pen.x = bl.x - spread * px_len;
         for (unsigned j = 0; j < width; ++j) {
-            float d = signed_dist(pen, CW); // todo
-            auto value = std::clamp(static_cast<int>(d * 127.5f / (spread * px_len) + 128.0f), 0, 255);
-            *buffer = static_cast<unsigned>(value); ++buffer;
+            float d = signed_dist(pen);
+            int value = std::clamp(static_cast<int>(d * 127.5f / (spread * px_len) + 128.0f), 0, 255);
+            *buffer = static_cast<unsigned char>(value); ++buffer;
+            pen.x += px_len;
+        }
+        pen.y += px_len;
+    }
+}
+
+struct Angle {
+    Vec2 origin;
+    Vec2 entry;
+    Vec2 exit;
+    bool is_convex(WindingOrder winding_order) const {
+        return (cross(entry, exit) < 0) ^ winding_order;
+    }
+};
+
+// op: The vector from the angle's origin to the point being evaluated.
+std::pair<float, float> resolve_angle(const Angle& angle, const Vec2& op, WindingOrder winding_order) {
+    auto dist = [](const Vec2& base, const Vec2& v) {
+        float product = dot(base, v);
+        float dist2 = v.len2() - product * product / base.len2();
+        return std::sqrt(dist2);
+        };
+
+    float d0 = dist(angle.entry, op);
+    float d1 = dist(angle.exit, op);
+
+    int section = ((cross(op, angle.entry) > 0) ^ winding_order) << 1 | (cross(op, angle.exit) > 0) ^ winding_order;
+    switch (section) {
+    case 0: // Diagonal
+        return { d0, d1 };
+        break;
+    case 1: // Entry(convex), Exit(concave)
+        return { d0, -d1 };
+        break;
+    case 2: // Exit(convex), Entry(concave)
+        return { -d0, d1 };
+        break;
+    case 3: // Inside
+        return { -d0, -d1 };
+        break;
+    }
+}
+
+void Shape::cmsdf(unsigned spread, float threshold, unsigned char* buffer, unsigned width, unsigned height) const {
+    // Collect all angles that are sharper than the threshold angle.
+    std::vector<Angle> angles;
+    for (unsigned i = 0; i < segments.size(); ++i) {
+        Vec2 a = segments[i].exit();
+        Vec2 b = segments[next(i)].entry();
+        if (-dot(a, b) > std::cos(threshold) * a.len() * b.len())
+            angles.push_back({ segments[i].p3, a, b });
+    }
+    std::cout << "Found " << angles.size() << " sharp angles." << std::endl;
+
+    auto [bl, tr] = cbounds();
+    float px_len = (tr.x - bl.x) / static_cast<float>(width - 2 * spread);
+
+    // Radius for corner calculation
+    const float corner_radius = 1.3f * px_len;
+    // Radius for storing LSB flag
+    const float lsb_radius = 2.5f * px_len;
+
+    Vec2 pen = Vec2(bl.x - spread * px_len, bl.y - spread * px_len) + Vec2(0.5f * px_len, 0.5f * px_len);
+    for (unsigned i = 0; i < height; ++i) {
+        pen.x = bl.x - spread * px_len;
+        for (unsigned j = 0; j < width; ++j) {
+            // For each pixel, check if it is close to an angle.
+            for (const auto& angle : angles) {
+                Vec2 op = pen - angle.origin;
+                float r = op.len();
+                if (r < lsb_radius) {
+                    if (r < corner_radius) {
+                        auto [d0, d1] = resolve_angle(angle, op, winding_order);
+                        int v0 = std::clamp(static_cast<int>(d0 * 127.5f / (spread * px_len) + 128.0f), 0, 255);
+                        int v1 = std::clamp(static_cast<int>(d1 * 127.5f / (spread * px_len) + 128.0f), 0, 255);
+                        if (angle.is_convex(winding_order))
+                            v0 &= ~1;
+                        else
+                            v0 |= 1;
+
+                        *buffer = static_cast<unsigned char>(v0); ++buffer;
+                        *buffer = static_cast<unsigned char>(v1); ++buffer;
+                    } else {
+                        float d = signed_dist(pen);
+                        int value = std::clamp(static_cast<int>(d * 127.5f / (spread * px_len) + 128.0f), 0, 255);
+                        int v0 = value;
+                        if (angle.is_convex(winding_order))
+                            v0 &= ~1;
+                        else
+                            v0 |= 1;
+                        *buffer = static_cast<unsigned char>(v0); ++buffer;
+                        *buffer = static_cast<unsigned char>(value); ++buffer;
+                    }
+                    goto next_iteration;
+                }
+            }
+            // If not close to an angle, compute the signed distance normally.
+            {
+                float d = signed_dist(pen);
+                int value = std::clamp(static_cast<int>(d * 127.5f / (spread * px_len) + 128.0f), 0, 255);
+                *buffer = static_cast<unsigned char>(value); ++buffer;
+                *buffer = static_cast<unsigned char>(value); ++buffer;
+            }
+next_iteration:
             pen.x += px_len;
         }
         pen.y += px_len;

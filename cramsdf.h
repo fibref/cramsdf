@@ -92,11 +92,13 @@ public:
     std::vector<SegmentType> types;
     // Stores the indices of the segments that start a contour.
     std::vector<unsigned> contours;
+    WindingOrder winding_order;
 
-    float signed_dist(const Vec2& point, WindingOrder winding_order) const;
+    float signed_dist(const Vec2& point) const;
     std::pair<Vec2, Vec2> cbounds() const;
     std::pair<unsigned, unsigned> buffer_info(unsigned spread) const;
     void sdf(unsigned spread, unsigned char* buffer, unsigned width, unsigned height) const;
+    void cmsdf(unsigned spread, float threshold, unsigned char* buffer, unsigned width, unsigned height) const;
 
 private:
     unsigned next(unsigned index) const {
